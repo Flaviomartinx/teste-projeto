@@ -1,0 +1,110 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.get-commit.outputs.hash }}
+    steps:
+      # 1. Checkout do código
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # 2. Login no Amazon ECR
+      - name: Log in to Amazon ECR
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ secrets.ECR_URI }}
+
+      # 3. Obter hash curto do commit
+      - name: Get short commit hash
+        id: get-commit
+        run: |
+          echo "hash=$(git rev-parse --short=5 HEAD)" >> $GITHUB_ENV
+
+      # 4. Build e push da imagem Docker
+      - name: Build and push Docker image
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          IMAGE_TAG: ${{ env.hash }}
+          REPOSITORY_URI: ${{ secrets.ECR_URI }}
+        run: |
+          cd Docker
+          docker build -t $REPOSITORY_URI:$IMAGE_TAG .
+          docker push $REPOSITORY_URI:$IMAGE_TAG
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_ENV
+
+  update-task-definition:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      # 1. Checkout do código
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # 2. Testar presença do arquivo JSON
+      - name: Validate JSON File
+        run: |
+          echo "Verifying ecs-task-definition-template.json..."
+          ls -l ecs-task-definition-template.json
+
+      # 3. Substituir placeholders no JSON
+      - name: Update Task Definition JSON
+        run: |
+          sed -i "s|ECR_URI|${{ secrets.ECR_URI }}|g" ecs-task-definition-template.json
+          sed -i "s|IMAGE_TAG|${{ needs.build-and-push.outputs.image_tag }}|g" ecs-task-definition-template.json
+          sed -i "s|ECS_EXECUTION_ROLE_ARN|${{ secrets.ECS_EXECUTION_ROLE_ARN }}|g" ecs-task-definition-template.json
+          sed -i "s|ECS_TASK_ROLE_ARN|${{ secrets.ECS_TASK_ROLE_ARN }}|g" ecs-task-definition-template.json
+          sed -i -e "/\"environment\"/a \ \ \ \ { \"name\": \"DB_NAME\", \"value\": \"${{ secrets.DB_NAME }}\" }," ecs-task-definition-template.json
+          sed -i -e "/\"environment\"/a \ \ \ \ { \"name\": \"DB_HOST\", \"value\": \"${{ secrets.DB_HOST }}\" }," ecs-task-definition-template.json
+          sed -i -e "/\"environment\"/a \ \ \ \ { \"name\": \"DB_USER\", \"value\": \"${{ secrets.DB_USER }}\" }," ecs-task-definition-template.json
+          sed -i -e "/\"environment\"/a \ \ \ \ { \"name\": \"DB_PASSWORD\", \"value\": \"${{ secrets.DB_PASSWORD }}\" }," ecs-task-definition-template.json
+
+      # 4. Registrar nova Task Definition no ECS
+      - name: Register Task Definition
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws ecs register-task-definition --cli-input-json file://ecs-task-definition-template.json
+
+      # 5. Atualizar o serviço no ECS
+      - name: Update ECS Service
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          NEW_TASK_DEF_ARN=$(aws ecs describe-task-definition --task-definition service_app:23 --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "New Task Definition ARN: $NEW_TASK_DEF_ARN"
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $NEW_TASK_DEF_ARN --debug
+
+  verify-deployment:
+    runs-on: ubuntu-latest
+    needs: update-task-definition
+    steps:
+      # 1. Verificar estado do serviço no ECSscaccas
+      - name: Verify ECS Deployment
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          echo "Deployment successful!"
